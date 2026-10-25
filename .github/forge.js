@@ -119,22 +119,27 @@ function usable(ct) {
 
 (async () => {
   const stamp = Date.now();
+  // v7 demands a mime_type ("a valid mime_type is required for this artifact version"), and v4/v6
+  // pin rsct to application/zip no matter the name -- so v7's mime_type is the one content-type
+  // input we have. Probe which values survive validation and what actually reaches the wire.
   const variants = [
-    { version: 4, name: `v4-${stamp}` },
-    { version: 6, name: `v6-${stamp}` },
-    { version: 7, name: `v7-${stamp}` },
-    { version: 4, name: `v4j-${stamp}.json` },
-    { version: 6, name: `v6j-${stamp}.json` },
-    { version: 7, name: `v7j-${stamp}.json` },
-    { version: 7, name: `v7n-${stamp}.json${NEL}` },
-    { version: 4, name: `v4n-${stamp}.json${NEL}` },
-    { version: 7, name: `v7t-${stamp}.txt` },
-  ];
+    { version: 7, mime: 'application/json', tag: 'plain' },
+    { version: 7, mime: 'application/json\u0085', tag: 'NEL' },
+    { version: 7, mime: 'application/json\u001c', tag: 'FS' },
+    { version: 7, mime: 'application/json ', tag: 'space' },
+    { version: 7, mime: 'application/json;charset=utf-8', tag: 'charset' },
+    { version: 7, mime: 'application/json,application/zip', tag: 'json-then-zip' },
+    { version: 7, mime: 'application/zip,application/json', tag: 'zip-then-json' },
+    { version: 7, mime: 'application/json\u0085;charset=utf-8', tag: 'NEL-then-charset' },
+    { version: 7, mime: 'text/plain', tag: 'textplain' },
+  ].map((v) => ({ ...v, name: `${v.tag}-${stamp}` }));
 
   const results = [];
   for (const v of variants) {
-    const label = `v=${v.version} name=${JSON.stringify(v.name)}`;
-    const created = await twirp('CreateArtifact', { ...ids, name: v.name, version: v.version });
+    const label = `v${v.version} ${v.tag} mime=${JSON.stringify(v.mime)}`;
+    const created = await twirp('CreateArtifact', {
+      ...ids, name: v.name, version: v.version, mime_type: v.mime,
+    });
     let signed;
     try { signed = JSON.parse(created.body.toString('utf8')).signed_upload_url; } catch { /* noop */ }
     if (!signed) {
@@ -144,7 +149,9 @@ function usable(ct) {
     const placeholder = build(0);
     const put = await putBlob(signed, placeholder, 'application/json');
     const digest = `sha256:${crypto.createHash('sha256').update(placeholder).digest('hex')}`;
-    const fin = await twirp('FinalizeArtifact', { ...ids, name: v.name, size: String(PAD_TO), hash: digest });
+    const fin = await twirp('FinalizeArtifact', {
+      ...ids, name: v.name, size: String(PAD_TO), hash: digest,
+    });
     if (fin.status !== 200) {
       console.log(`[-] ${label} put=${put.status} finalize=${fin.status} ${fin.body.toString('utf8').slice(0, 140)}`);
       continue;
