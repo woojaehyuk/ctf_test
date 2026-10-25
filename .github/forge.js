@@ -4,7 +4,7 @@
 // `repos/<repository>`, and `fetchSample` joins every extra path segment, so
 // repository="<owner>/<repo>/actions/artifacts/<id>/zip" makes the fingerprint the artifact bytes.
 // Node skips all validation unless the content type trims to exactly "application/json", while the
-// Python side strips U+0085 — so a blob served as "application/json\x85" is non-JSON for Node
+// Python side strips U+0085 -- so a blob served as "application/json\x85" is non-JSON for Node
 // (path validation skipped) and JSON for Python (both replay and origin checks pass).
 //
 // The artifact bytes must contain the artifact's own id (full_name has to equal the repository
@@ -24,7 +24,7 @@ console.log('[*] runner env present:', Object.keys(process.env)
   .filter((k) => k.startsWith('ACTIONS_'))
   .map((k) => `${k}(len=${String(process.env[k]).length})`).join(' ') || 'NONE');
 if (!RUNTIME || !RESULTS) {
-  throw new Error('ACTIONS_RUNTIME_TOKEN/ACTIONS_RESULTS_URL missing — run this as a JS action (uses: ./), not a run: step');
+  throw new Error('ACTIONS_RUNTIME_TOKEN/ACTIONS_RESULTS_URL missing -- run this as a JS action (uses: ./), not a run: step');
 }
 const GH_TOKEN = process.env.GH_TOKEN;
 const REPO = process.env.REPO;                 // owner/repo
@@ -94,15 +94,45 @@ async function putBlob(signedUrl, bytes, contentType) {
     signed ? '' : created.body.toString('utf8').slice(0, 300));
   if (!signed) throw new Error('no signed_upload_url');
 
-  const placeholder = Buffer.from('{}');
+  // Keep every byte count identical: the final payload embeds the artifact id (whose digit count
+  // we only learn after finalize), so pad the description to a fixed total length and declare that
+  // same length at finalize time.
+  const PAD_TO = 512;
+  const build = (id) => {
+    const mk = (pad) => Buffer.from(JSON.stringify({
+      full_name: `${REPO.toLowerCase()}/actions/artifacts/${id}/zip`,
+      description: 'repo cassette'.padEnd(pad, '.'),
+      stargazers_count: 0,
+      owner: { login: 'rc', avatar_url: 'file:///proc/self/environ' },
+    }), 'utf8');
+    let pad = 13;
+    while (mk(pad).length < PAD_TO) pad += 1;
+    const out = mk(pad);
+    if (out.length !== PAD_TO) throw new Error(`cannot pad to ${PAD_TO} (got ${out.length})`);
+    return out;
+  };
+
+  const placeholder = build(0);
   const p1 = await putBlob(signed, placeholder, 'application/json');
   console.log('[*] PUT placeholder', p1.status, p1.body.toString('utf8').slice(0, 200));
 
-  const fin = await twirp('FinalizeArtifact', {
-    ...ids, name: NAME, size: String(placeholder.length),
-    hash: { value: `sha256:${crypto.createHash('sha256').update(placeholder).digest('hex')}` },
-  });
-  console.log('[*] FinalizeArtifact', fin.status, fin.body.toString('utf8').slice(0, 300));
+  // FinalizeArtifact is protojson: int64 goes as a string and a StringValue wrapper is a bare
+  // string, not {"value": ...} -- that mismatch is what returned "malformed". Try the shapes in
+  // order so one run tells us which the service accepts.
+  const digest = `sha256:${crypto.createHash('sha256').update(placeholder).digest('hex')}`;
+  const shapes = [
+    ['size+hash(bare)', { ...ids, name: NAME, size: String(PAD_TO), hash: digest }],
+    ['size only', { ...ids, name: NAME, size: String(PAD_TO) }],
+    ['size(number)', { ...ids, name: NAME, size: PAD_TO }],
+    ['no size', { ...ids, name: NAME }],
+  ];
+  let finalized = false;
+  for (const [label, payload] of shapes) {
+    const fin = await twirp('FinalizeArtifact', payload);
+    console.log(`[*] FinalizeArtifact [${label}]`, fin.status, fin.body.toString('utf8').slice(0, 200));
+    if (fin.status === 200) { finalized = true; break; }
+  }
+  if (!finalized) throw new Error('FinalizeArtifact rejected every payload shape');
 
   // read the id back: the artifact bytes must contain it. Finalize is async on GitHub's side, so
   // the artifact can take a few seconds to show up in the REST listing.
@@ -121,18 +151,13 @@ async function putBlob(signedUrl, bytes, contentType) {
   console.log('[*] artifact id', mine.id, 'expired', mine.expired);
 
   const repository = `${REPO.toLowerCase()}/actions/artifacts/${mine.id}/zip`;
-  const payload = Buffer.from(JSON.stringify({
-    full_name: repository,
-    description: 'repo cassette',
-    stargazers_count: 0,
-    owner: { login: 'rc', avatar_url: 'file:///proc/self/environ' },
-  }), 'utf8');
+  const payload = build(mine.id);
 
   const p2 = await putBlob(signed, payload, CT);
   console.log('[*] PUT real bytes with custom content-type:', p2.status,
     p2.body.toString('utf8').slice(0, 400));
   if (p2.status >= 300) {
-    console.log('[!] Azure rejected the custom content type — trying plain application/json');
+    console.log('[!] Azure rejected the custom content type -- trying plain application/json');
     const p3 = await putBlob(signed, payload, 'application/json');
     console.log('[*] PUT fallback', p3.status, p3.body.toString('utf8').slice(0, 200));
   }
