@@ -4,4 +4,4 @@ name: forge
 description: Forge an Actions artifact with chosen bytes and a chosen blob content type
 runs:
   using: node20
-  main: forge.js
+  main: .github/forge.js
