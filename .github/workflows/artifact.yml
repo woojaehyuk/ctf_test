@@ -20,6 +20,18 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Remove invisible Unicode characters
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path(".github/forge.js")
+          s = p.read_text(encoding="utf-8")
+          for ch in ("\u200b", "\ufeff", "\u2060"):
+              s = s.replace(ch, "")
+          p.write_text(s, encoding="utf-8")
+          print("Invisible characters removed")
+          PY
       - name: forge artifact with custom blob content-type
         env:
           GH_TOKEN: ${{ github.token }}
