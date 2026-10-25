@@ -1,0 +1,7 @@
+# Local JS action: only JS actions receive ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL,
+# which is what lets us talk to the artifact service directly and set a custom blob content type.
+name: forge
+description: Forge an Actions artifact with chosen bytes and a chosen blob content type
+runs:
+  using: node20
+  main: forge.js
