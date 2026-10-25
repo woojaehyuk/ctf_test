@@ -153,35 +153,62 @@ async function putBlob(signedUrl, bytes, contentType) {
   const repository = `${REPO.toLowerCase()}/actions/artifacts/${mine.id}/zip`;
   const payload = build(mine.id);
 
-  const p2 = await putBlob(signed, payload, CT);
-  console.log('[*] PUT real bytes with custom content-type:', p2.status,
-    p2.body.toString('utf8').slice(0, 400));
-  if (p2.status >= 300) {
-    console.log('[!] Azure rejected the custom content type -- trying plain application/json');
-    const p3 = await putBlob(signed, payload, 'application/json');
-    console.log('[*] PUT fallback', p3.status, p3.body.toString('utf8').slice(0, 200));
+  // The served content type came back as application/zip even though we set the blob's type,
+  // which means something downstream overrides it (most likely the SAS "rsct" response-content-type
+  // parameter on GitHub's redirect). Probe the whole matrix in one run: for each candidate blob
+  // content type, re-PUT and report what api.github.com actually serves, plus the redirect's query
+  // parameter names (names only -- "sig" is a credential and is never printed).
+  const candidates = [
+    ['json+NEL', 'application/json\u0085'],
+    ['json', 'application/json'],
+    ['empty', ''],
+    ['omit', null],
+    ['json;charset+NEL', 'application/json; charset=utf-8\u0085'],
+  ];
+
+  let best = null;
+  for (const [label, ct] of candidates) {
+    const put = await putBlob(signed, payload, ct);
+    const dl = await req('GET', `https://api.github.com/repos/${REPO}/actions/artifacts/${mine.id}/zip`, {
+      authorization: `Bearer ${GH_TOKEN}`, accept: 'application/vnd.github+json', 'user-agent': 'forge',
+    });
+    let final = dl;
+    let params = [];
+    if (dl.headers.location) {
+      const loc = new URL(dl.headers.location);
+      params = [...loc.searchParams.keys()];
+      const rsct = loc.searchParams.get('rsct');
+      const rscd = loc.searchParams.get('rscd');
+      console.log(`    redirect host=${loc.hostname} params=${params.join(',')}`
+        + (rsct !== null ? ` rsct=${JSON.stringify(rsct)}` : '')
+        + (rscd !== null ? ` rscd=${JSON.stringify(rscd)}` : ''));
+      final = await req('GET', dl.headers.location, { 'user-agent': 'forge' });
+    }
+    const got = final.headers['content-type'] || '';
+    const hex = Buffer.from(got, 'latin1').toString('hex');
+    const ok = got.replace(/[\u0085\u001c-\u001f]/g, '').split(';')[0].trim() === 'application/json'
+      && got !== 'application/json' && got.includes('\u0085');
+    console.log(`[*] blob-ct[${label}] put=${put.status} served=${JSON.stringify(got)} hex=${hex}`
+      + ` bodyOk=${final.body.equals(payload)}${ok ? '  <-- USABLE' : ''}`);
+    if (ok && !best) best = { label, ct, served: got, hex };
   }
 
-  // verify what api.github.com actually serves (follow the redirect by hand)
-  const dl = await req('GET', `https://api.github.com/repos/${REPO}/actions/artifacts/${mine.id}/zip`, {
+  // leave the blob in the best state we found (or the NEL attempt if none worked)
+  const finalCt = best ? best.ct : 'application/json\u0085';
+  await putBlob(signed, payload, finalCt);
+  const dl2 = await req('GET', `https://api.github.com/repos/${REPO}/actions/artifacts/${mine.id}/zip`, {
     authorization: `Bearer ${GH_TOKEN}`, accept: 'application/vnd.github+json', 'user-agent': 'forge',
   });
-  console.log('[*] download status', dl.status, 'location?', !!dl.headers.location);
-  let final = dl;
-  if (dl.headers.location) {
-    final = await req('GET', dl.headers.location, { 'user-agent': 'forge' });
-  }
-  const ctHeader = final.headers['content-type'] || '';
-  console.log('[*] final status', final.status);
-  console.log('[*] final content-type       :', JSON.stringify(ctHeader));
-  console.log('[*] final content-type (hex) :', Buffer.from(ctHeader, 'latin1').toString('hex'));
-  console.log('[*] final body               :', final.body.toString('utf8').slice(0, 400));
-  console.log('[*] final body sha256        :', crypto.createHash('sha256').update(final.body).digest('hex'));
+  const final2 = dl2.headers.location
+    ? await req('GET', dl2.headers.location, { 'user-agent': 'forge' }) : dl2;
+  const ctHeader = final2.headers['content-type'] || '';
+  console.log('[*] left blob with', JSON.stringify(finalCt), '-> served', JSON.stringify(ctHeader));
 
   console.log('\n===== HAND THIS BACK =====');
   console.log('REPOSITORY=' + repository);
   console.log('ARTIFACT_ID=' + mine.id);
-  console.log('BODY_B64=' + final.body.toString('base64'));
+  console.log('BODY_B64=' + final2.body.toString('base64'));
   console.log('CT_HEX=' + Buffer.from(ctHeader, 'latin1').toString('hex'));
   console.log('CT_HAS_0x85=' + (ctHeader.includes('\u0085') ? 'YES' : 'NO'));
+  console.log('BODY_MATCHES=' + final2.body.equals(payload));
 })().catch((e) => { console.error('[x]', e); process.exit(1); });
