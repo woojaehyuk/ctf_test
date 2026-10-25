@@ -1,10 +1,3 @@
-# Put this at .github/workflows/artifact.yml in a PUBLIC repo on your account,
-# together with .github/forge.js (copy of solve/gh/forge.js), then run it from the Actions tab.
-#
-# It uploads one tiny artifact whose blob content type is "application/json\x85" and whose bytes
-# are the JSON repo-cassette will replay, and prints everything needed at the end
-# (REPOSITORY / ARTIFACT_ID / BODY_B64 / CT_HEX / CT_HAS_0x85).
-
 name: artifact
 
 on:
@@ -18,8 +11,10 @@ jobs:
     permissions:
       actions: read
       contents: read
+
     steps:
       - uses: actions/checkout@v4
+
       - name: Remove invisible Unicode characters
         run: |
           python3 - <<'PY'
@@ -32,10 +27,9 @@ jobs:
           p.write_text(s, encoding="utf-8")
           print("Invisible characters removed")
           PY
-      - name: forge artifact with custom blob content-type
+
       - uses: ./
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ART_NAME: rc
-        run: node .github/forge.js
