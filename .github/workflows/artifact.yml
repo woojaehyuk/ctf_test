@@ -33,6 +33,7 @@ jobs:
           print("Invisible characters removed")
           PY
       - name: forge artifact with custom blob content-type
+      - uses: ./
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
